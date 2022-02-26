@@ -16,6 +16,7 @@
 from collections import OrderedDict
 from contextlib import contextmanager
 import re
+import time
 
 from robot.errors import (BreakLoop, ContinueLoop, DataError, ExecutionFailed,
                           ExecutionFailures, ExecutionPassed, ExecutionStatus)
@@ -25,7 +26,7 @@ from robot.result import (For as ForResult, While as WhileResult, If as IfResult
 from robot.output import librarylogger as logger
 from robot.utils import (cut_assign_value, frange, get_error_message, is_string,
                          is_list_like, is_number, plural_or_not as s,
-                         split_from_equals, type_name, Matcher)
+                         split_from_equals, type_name, Matcher, timestr_to_secs)
 from robot.variables import is_dict_variable, evaluate_expression
 
 from .statusreporter import StatusReporter
@@ -341,9 +342,12 @@ class WhileRunner:
                 return
             if data.error:
                 raise DataError(data.error)
-            while self._should_run(data.condition, self._context.variables):
+            limit = RunLimit(data.limit, self._context.variables)
+            limit.start()
+            while self._should_run(data.condition, limit, self._context.variables):
                 executed_once = True
                 try:
+                    limit.start_iteration()
                     self._run_iteration(data, result, run)
                 except BreakLoop:
                     break
@@ -358,7 +362,10 @@ class WhileRunner:
         with StatusReporter(data, result.body.create_iteration(), self._context, run):
             runner.run(data.body)
 
-    def _should_run(self, condition, variables):
+    def _should_run(self, condition, limit, variables):
+        if not limit.more_iterations_allowed():
+            raise ExecutionFailed(
+                f'While loop aborted due to not terminating within {limit.message}.')
         try:
             condition = variables.replace_scalar(condition)
             if is_string(condition):
@@ -556,3 +563,78 @@ class TryRunner:
                 return err
             else:
                 return None
+
+
+class NoLimit:
+
+    def start(self):
+        pass
+
+    def start_iteration(self):
+        pass
+
+    def more_iterations_allowed(self):
+        return True
+
+
+class TimeLimit:
+
+    def __init__(self, max_time):
+        self.max_time = max_time
+        self.start_time = None
+
+    def start(self):
+        self.start_time = time.time()
+
+    def start_iteration(self):
+        pass
+
+    def more_iterations_allowed(self):
+        return time.time() - self.start_time < self.max_time
+
+    @property
+    def message(self):
+        return f'{self.max_time} seconds'
+
+
+class IterationLimit:
+
+    def __init__(self, max_iterations):
+        self.max_iterations = max_iterations
+        self.current_iterations = 0
+
+    def start(self):
+        pass
+
+    def start_iteration(self):
+        self.current_iterations += 1
+
+    def more_iterations_allowed(self):
+        return self.current_iterations <= self.max_iterations
+
+    @property
+    def message(self):
+        return f'{self.max_iterations} iterations'
+
+
+def RunLimit(limit, variables):
+    if not limit:
+        return IterationLimit(100)
+    value = variables.replace_scalar(limit.replace('limit=', ''))
+    if value.upper() == 'NONE':
+        return NoLimit()
+    if value.endswith('x'):
+        return IterationLimit(parse_iteration_count(value[:-1]))
+    if value.endswith('times'):
+        return IterationLimit(parse_iteration_count(value[:-5]))
+    return TimeLimit(timestr_to_secs(value, accept_plain_values=False))
+
+
+def parse_iteration_count(limit):
+    try:
+        limit = int(limit)
+        if limit <= 0:
+            raise ValueError
+        return limit
+    except ValueError:
+        raise ValueError(f"Iteration limit must be positive integer when using 'x' or 'times', got: '{limit}'")
